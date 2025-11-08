@@ -1,0 +1,427 @@
+image: python:3.11.8
+
+variables:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  POETRY_VIRTUALENVS_CREATE: "true"
+  PYTEST_JUNIT: "pytest-junit.xml"
+  CI_SP_GITLAB_USER_NAME: "project_75889843_bot_4fb2b7c3bc56fc5592e73ea665fd0060"
+  LEADERBOARD_BRANCH: "leaderboard"   # <— write results to this branch
+
+
+stages:
+  - test
+  - validate
+  - score
+
+# =========================
+# Shared helpers & install
+# =========================
+.default_poetry_install: &default_poetry_install
+  - pip install --upgrade pip
+  - pip install poetry
+  - poetry install --no-interaction
+# Robust team detection (used only when validate/score jobs actually run)
+.detect_team_dir: &detect_team_dir |
+  # Exit on any error, undefined variable, or pipe failure
+  set -euo pipefail
+  
+  # Determine the base and head commit SHAs for diff comparison
+  # Handle both merge requests targeting main and direct pushes to main
+  if [[ -n "${CI_MERGE_REQUEST_TARGET_BRANCH_SHA:-}" ]] && [[ "${CI_MERGE_REQUEST_TARGET_BRANCH_NAME:-}" == "main" ]]; then
+    # For merge requests targeting main, compare the entire MR branch against main
+    BASE_SHA="${CI_MERGE_REQUEST_TARGET_BRANCH_SHA}"
+    HEAD_SHA="${CI_COMMIT_SHA}"
+    echo "[info] Source: Merge Request to main - comparing MR branch against main"
+  elif [[ -n "${CI_MERGE_REQUEST_DIFF_BASE_SHA:-}" ]] && [[ "${CI_MERGE_REQUEST_TARGET_BRANCH_NAME:-}" == "main" ]]; then
+    # Alternative MR detection using diff base SHA for MRs targeting main
+    BASE_SHA="${CI_MERGE_REQUEST_DIFF_BASE_SHA}"
+    HEAD_SHA="${CI_COMMIT_SHA}"
+    echo "[info] Source: Merge Request to main (diff base) - comparing MR branch against main"
+  elif [[ "${CI_COMMIT_BRANCH:-}" == "main" ]]; then
+    # For direct pushes to main branch
+    BASE_SHA="$(git rev-parse HEAD~1 || echo "")"
+    HEAD_SHA="${CI_COMMIT_SHA}"
+    echo "[info] Source: Direct push to main - comparing against previous commit"
+  else
+    # Skip processing for branches other than main or MRs not targeting main
+    echo "[info] Skipping: Not a push to main or MR targeting main"
+    echo "[info] Current branch: ${CI_COMMIT_BRANCH:-unknown}"
+    echo "[info] MR target branch: ${CI_MERGE_REQUEST_TARGET_BRANCH_NAME:-none}"
+    exit 0
+  fi
+  # Log the commit SHAs being used for comparison
+  echo "[info] BASE_SHA=${BASE_SHA}  HEAD_SHA=${HEAD_SHA}"
+  
+  # DEBUG: List ALL changed files first
+  if [[ -n "${BASE_SHA}" ]]; then
+    echo "[debug] ALL changed files between ${BASE_SHA} and ${HEAD_SHA}:"
+    git diff --name-only --diff-filter=ACMR "${BASE_SHA}" "${HEAD_SHA}" || echo "[debug] git diff failed"
+    echo "[debug] --- end of all changed files ---"
+    
+    # Get diff between base and head, including added files, filter for submission files
+    CHANGED=$(git diff --name-only --diff-filter=ACMR "${BASE_SHA}" "${HEAD_SHA}" | grep -E '^teams/[^/]+/submission\.json$' || true)
+  else
+    echo "[error] No BASE_SHA available for comparison"
+    exit 1
+  fi
+  
+  # DEBUG: Show the grep command result
+  echo "[debug] CHANGED variable content:"
+  echo "'${CHANGED}'"
+  echo "[debug] CHANGED variable length: ${#CHANGED}"
+  
+  # Display the list of changed submission files
+  echo "[info] changed submission files:"
+  echo "${CHANGED}"
+  
+  # Handle empty CHANGED variable
+  if [[ -z "${CHANGED}" ]]; then
+    echo "[error] No team submission files changed."
+    exit 1
+  fi
+  # Extract unique team directory names from the changed files
+  mapfile -t UNIQUE_DIRS < <(echo "${CHANGED}" | awk -F'/' '{print $1"/"$2}' | sort -u)
+  
+  # Count how many unique team directories were affected
+  COUNT=${#UNIQUE_DIRS[@]}
+  
+  # Validate that exactly one team submission was changed
+  if [[ "${COUNT}" -eq 0 ]]; then
+    echo "[error] No changed team submission found (teams/<team>/submission.json)."
+    exit 1
+  fi
+  
+  # Enforce single team per MR/push policy
+  if [[ "${COUNT}" -gt 1 ]]; then
+    echo "[error] Multiple team submissions changed in a single MR/push:"
+    printf ' - %s\n' "${UNIQUE_DIRS[@]}"
+    echo "        Please submit one team per MR."
+    exit 1
+  fi
+  
+  # Set environment variables for the detected team
+    export TEAM_DIR="${UNIQUE_DIRS[0]}"          # e.g., "teams/team1"
+    export TEAM_NAME="$(basename "${TEAM_DIR}")" # e.g., "team1"
+    export SUBMISSION_FILE="${TEAM_DIR}/submission.json" # e.g., "teams/team1/submission.json"
+    
+    # Display and validate the extracted values
+    echo "[info] Extracted values:"
+    echo "  UNIQUE_DIRS='${UNIQUE_DIRS[*]}'"
+    echo "  TEAM_DIR='${TEAM_DIR}'"
+    echo "  TEAM_NAME='${TEAM_NAME}'"
+    echo "  SUBMISSION_FILE='${SUBMISSION_FILE}'"
+    
+    # Validate that none of the values are empty
+    if [[ -z "${TEAM_DIR}" ]]; then
+      echo "[error] TEAM_DIR is empty"
+      exit 1
+    fi
+    
+    if [[ -z "${TEAM_NAME}" ]]; then
+      echo "[error] TEAM_NAME is empty"
+      exit 1
+    fi
+    
+    if [[ -z "${SUBMISSION_FILE}" ]]; then
+      echo "[error] SUBMISSION_FILE is empty"
+      exit 1
+    fi
+  
+  # Verify the submission file actually exists
+  if [[ ! -f "${SUBMISSION_FILE}" ]]; then
+    echo "[error] Expected submission file not found: ${SUBMISSION_FILE}"
+    exit 1
+  fi
+  
+  # Log the final extracted values
+  echo "[info] TEAM_DIR=${TEAM_DIR}"
+  echo "[info] TEAM_NAME=${TEAM_NAME}"
+  echo "[info] SUBMISSION_FILE=${SUBMISSION_FILE}"
+
+.init_git_remote: &init_git_remote
+  # - git config --global user.name "$GIT_AUTHOR_NAME"
+  # - git config --global user.email "$GIT_AUTHOR_EMAIL"
+  # # Configure auth; prefer CI_JOB_TOKEN if allowed for push, otherwise use PAT
+  # # Using CI token:
+  # - |
+  #   if [ -n "${CI_JOB_TOKEN:-}" ]; then
+  #     git remote set-url origin "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+  #   elif [ -n "${GITLAB_TOKEN:-}" ]; then
+  #     git remote set-url origin "https://oauth2:${GITLAB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+  #   fi
+  - GITLAB_HOST=$(echo "$CI_PROJECT_URL" | cut -d/ -f3)
+  - CI_SP_GITLAB_USER_EMAIL="${CI_SP_GITLAB_USER_NAME}@noreply.$GITLAB_HOST"
+  - echo "[info] GITLAB_HOST=${GITLAB_HOST}"
+  - echo "[info] CI_SERVER_HOST=${CI_SERVER_HOST}"
+  - echo "[info] CI_SP_GITLAB_USER_NAME=${CI_SP_GITLAB_USER_NAME}"
+  - echo "[info] CI_SP_GITLAB_USER_EMAIL=${CI_SP_GITLAB_USER_EMAIL}"
+  - git config --global user.name "$CI_SP_GITLAB_USER_NAME"
+  - git config --global user.email "$CI_SP_GITLAB_USER_EMAIL"
+  - PROJECT_URL="${CI_SERVER_PROTOCOL}://TAMU_CI_SP:${TAMU_CI_SP_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}"
+  - echo "${PROJECT_URL}"
+  - git remote set-url origin ${PROJECT_URL}
+  # Ensure we have all refs
+  - git fetch --all --prune
+# =========================
+# 1) Unit tests (pytest)
+# Always run on MR and push; other jobs are conditional
+# =========================
+unit_tests:
+  stage: test
+  script:
+    - *default_poetry_install
+    - poetry run pytest -q --junitxml="$PYTEST_JUNIT"
+  artifacts:
+    when: always
+    reports:
+      junit: "$PYTEST_JUNIT"
+    paths:
+      - "$PYTEST_JUNIT"
+    expire_in: 1 week
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: always
+    - if: '$CI_COMMIT_BRANCH'   # any branch push
+      when: always
+# =====================================
+# 2) Validation (schema & coverage)
+# Only runs when a team submission file changes
+# =====================================
+validate_submission:
+  stage: validate
+  needs: ["unit_tests"]
+  before_script:
+    - *default_poetry_install
+    - *detect_team_dir
+  script:
+    - cat data/queries_synth_test.json
+    # - cmd="poetry run tamu25 validate --submission ${SUBMISSION_FILE} --products data/products.json --queries_real data/queries_real.json --queries_synth data/queries_synth.json --team ${TEAM_NAME} --out validation_report.json"
+    - cmd="poetry run tamu25 validate --submission ${SUBMISSION_FILE} --products data/products.json --queries_synth data/queries_synth_test.json --team ${TEAM_NAME} --out validation_report.json"
+    - echo "$cmd"
+    - $cmd
+  artifacts:
+    when: always
+    paths:
+      - validation_report.json
+    expire_in: 1 week
+  allow_failure: false
+  rules:
+    # Run only if a team submission file changed (MR or push)
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+      - teams/*/submission.json
+      when: on_success
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      changes:
+      - teams/*/submission.json
+      when: on_success
+    - when: never
+# =====================================
+# 3) Scoring (real + synthetic metrics)
+# Only runs when a team submission file changes
+# =====================================
+score_submission:
+  stage: score
+  # needs: ["validate_submission"]
+  before_script:
+    - *default_poetry_install
+    - *detect_team_dir
+    - cp data/queries_synth_test.json data/queries_synth.json
+    - echo "${GCP_SP_KEY_2}" | base64 --decode > /tmp/service-account-key.json
+    - cat /tmp/service-account-key.json
+    - export GOOGLE_APPLICATION_CREDENTIALS="/tmp/service-account-key.json"
+    - cmd="poetry run tamu25 download_gcs_file --bucket_name ${BUCKET_NAME} --source_blob_name ${SOURCE_BLOB_NAME} --destination_file_name /tmp/labels_synth.json --credentials_path /tmp/service-account-key.json"
+    - echo "$cmd"
+    - $cmd
+    - mv /tmp/labels_synth.json data/labels_synth.json
+    - $cmd
+
+  script:
+    # - cmd="poetry run tamu25 evaluate --submission ${SUBMISSION_FILE} --labels_real data/labels_real.json --labels_synth data/labels_synth.json --team ${TEAM_NAME} --out score_report.json"
+    - cmd="poetry run tamu25 evaluate --submission ${SUBMISSION_FILE} --labels_synth data/labels_synth.json --team ${TEAM_NAME} --out score_report.json"
+    - echo "$cmd"
+    - $cmd
+    # Attach metadata for resubmission tracking (useful for leaderboards)
+    - |
+      python - << 'PY'
+      import json, os, datetime
+      meta = {
+        "team": os.environ.get("TEAM_NAME",""),
+        "team_dir": os.environ.get("TEAM_DIR",""),
+        "submission_file": os.environ.get("SUBMISSION_FILE",""),
+        "pipeline_id": os.environ.get("CI_PIPELINE_ID",""),
+        "pipeline_url": os.environ.get("CI_PIPELINE_URL",""),
+        "commit_sha": os.environ.get("CI_COMMIT_SHA",""),
+        "mr_iid": os.environ.get("CI_MERGE_REQUEST_IID",""),
+        "timestamp_utc": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+      }
+      with open("metadata.json","w",encoding="utf-8") as f:
+          json.dump(meta, f, indent=2)
+      PY
+    - echo "[info] score_report.json:"
+    - cat score_report.json
+    # Export environment variables for next job
+    - echo "TEAM_NAME=${TEAM_NAME}" >> score_env.env
+    - echo "TEAM_DIR=${TEAM_DIR}" >> score_env.env
+    - echo "SUBMISSION_FILE=${SUBMISSION_FILE}" >> score_env.env
+  artifacts:
+    when: always
+    reports:
+      dotenv: score_env.env
+    paths:
+      - score_report.json
+      - metadata.json
+      - score_env.env
+    expire_in: 1 week
+  allow_failure: false
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      changes:
+      - teams/*/submission.json
+      when: on_success
+    - when: never
+# =====================================
+persist_score:
+  stage: score
+  needs:
+    - job: "score_submission"
+      artifacts: true
+  image: alpine:3.20
+  before_script:
+    - apk add --no-cache git
+    - *init_git_remote
+    # Stash any local changes to avoid checkout conflicts
+    - git stash push -m "Stash CI local changes before checkout" || true
+    # Check out the target branch for committing artifacts
+    - git checkout "$LEADERBOARD_BRANCH"
+    # Reset any unmerged files and pull latest changes
+    - git reset --hard HEAD || true
+    - git pull --ff-only origin "$LEADERBOARD_BRANCH" || git reset --hard origin/"$LEADERBOARD_BRANCH"
+     # Apply stashed changes if they exist and are relevant
+    - git stash pop || true
+  script:
+    - DEST="leaderboard/runs/${TEAM_NAME}/${CI_PIPELINE_ID}"
+    - mkdir -p "$DEST"
+    - ls -lrt
+    - if [ -f "score_report.json" ]; then
+        mv score_report.json "$DEST/score_report.json";
+      else
+        echo "[error] score_report.json not found";
+        exit 1;
+      fi
+    - if [ -f "metadata.json" ]; then
+        mv metadata.json "$DEST/metadata.json";
+      else
+        echo "[error] metadata.json not found";
+        exit 1;
+      fi
+    - git add "$DEST/score_report.json" "$DEST/metadata.json"
+    - if git diff --name-only --diff-filter=U | grep -q .; then
+        echo "[error] Unresolved merge conflicts detected:";
+        git diff --name-only --diff-filter=U;
+        echo "[debug] File changes:";
+        git diff --diff-filter=U;
+      fi
+    - if git diff --name-only --diff-filter=U | grep -q .; then
+        echo "[warning] Unresolved merge conflicts detected. Resolving by enforcing current changes.";
+        git checkout --theirs .;
+        git add .;
+      fi 
+    - |
+      if ! git commit -m "leaderboard - ${TEAM_NAME} pipeline ${CI_PIPELINE_ID}"; then
+        if git diff --cached --quiet; then
+          echo "[info] no changes to commit"
+        else
+          echo "[error] git commit failed"
+          exit 1
+        fi
+      fi
+    - git push origin "$LEADERBOARD_BRANCH"
+  artifacts:
+    when: always
+    paths:
+      - score_report.json
+      - metadata.json
+    expire_in: 1 week
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      changes:
+      - teams/*/submission.json
+      when: on_success
+    - when: never
+# =====================================
+build_leaderboard:
+  stage: score
+  needs: ["persist_score"]
+  image: python:3.11.8
+  before_script:
+    - *init_git_remote
+    - pip install --upgrade pip
+    - pip install pytz
+    - git fetch origin leaderboard
+    - git stash push -m "Stash CI local changes before checkout" || true
+    - git checkout leaderboard
+    # Reset any unmerged files and pull latest changes
+    - git reset --hard HEAD || true
+    - git pull --ff-only origin "$LEADERBOARD_BRANCH" || git reset --hard origin/"$LEADERBOARD_BRANCH"
+    # Apply stashed changes if they exist and are relevant
+    - git stash pop || true
+  script:
+    - python scripts/aggregate_leaderboard.py 
+    - cat leaderboard/leaderboard.md
+    - echo "[info] generated leaderboard/leaderboard.md and leaderboard.json"
+    # commit the updates
+    - |
+      git add leaderboard/leaderboard.md leaderboard/leaderboard.json
+      if git diff --cached --quiet; then
+        echo "[info] No leaderboard changes detected."
+      else
+        git commit -m "Update aggregated leaderboard"
+        git push origin "$LEADERBOARD_BRANCH"
+      fi
+    # print preview
+    - echo "----- Leaderboard Preview -----"
+    - head -n 20 leaderboard/leaderboard.md || true
+  artifacts:
+    when: always
+    paths:
+      - leaderboard/leaderboard.json
+      - leaderboard/leaderboard.md
+    expire_in: 1 week
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      changes:
+      - teams/*/submission.json
+      when: on_success
+    - when: never
+# =====================================
+pages:
+  stage: score
+  needs: ["build_leaderboard"]
+  image: alpine:3.20
+  before_script:
+    - apk add --no-cache git
+    - *init_git_remote
+    - git fetch origin "$LEADERBOARD_BRANCH"
+    # Stash any local changes to avoid checkout conflicts
+    - git stash push -m "Stash CI local changes before checkout" || true
+    # Remove untracked files that would conflict with checkout
+    - rm -f leaderboard/leaderboard.json leaderboard/leaderboard.md
+    # Force checkout from remote leaderboard branch (always use remote state)
+    - git checkout --no-guess origin/"$LEADERBOARD_BRANCH" --
+    # # Reset any unmerged files and pull latest changes
+    - git reset --hard HEAD || true
+    - git pull --ff-only origin "$LEADERBOARD_BRANCH" || git reset --hard origin/"$LEADERBOARD_BRANCH"
+  script:
+    - mkdir -p public
+    - cp leaderboard/leaderboard.md public/index.md
+    - cp leaderboard/leaderboard.json public/leaderboard.json
+  artifacts:
+    paths: [ public ]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      changes:
+      - teams/*/submission.json
+      when: on_success
+    - when: never
+# =====================================

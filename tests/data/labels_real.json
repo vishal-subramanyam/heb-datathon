@@ -1,0 +1,11 @@
+[
+  {"query_id": "Q001", "product_id": "0001", "relevance": 3},
+  {"query_id": "Q001", "product_id": "0010", "relevance": 2},
+  {"query_id": "Q001", "product_id": "0002", "relevance": 1},
+  {"query_id": "Q002", "product_id": "0003", "relevance": 3},
+  {"query_id": "Q002", "product_id": "0009", "relevance": 2},
+  {"query_id": "Q003", "product_id": "0007", "relevance": 3},
+  {"query_id": "Q003", "product_id": "0008", "relevance": 1},
+  {"query_id": "Q004", "product_id": "0005", "relevance": 3},
+  {"query_id": "Q004", "product_id": "0006", "relevance": 1}
+]
